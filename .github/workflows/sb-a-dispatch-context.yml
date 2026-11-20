@@ -1,0 +1,64 @@
+# Disposable sandbox workflow (synthetic data only).
+# .github/workflows/sb-a-dispatch-context.yml inside the public SANDBOX repository only, after the human approved Phase 3-B2B.
+#
+# Workflow A (manual): record a minimal, allow-listed copy of the Actions context + the workflow_dispatch payload shape.
+# Read-only token, no secrets, no environment, no PR code. Nothing is printed except the run-count guard line.
+name: sb-a-dispatch-context
+on:
+  workflow_dispatch: {}                     # started by hand only (gh workflow run / Actions tab); no schedule, no push trigger
+permissions: {}                             # least privilege at workflow level; the job lists what it needs
+
+jobs:
+  capture:
+    if: vars.SB_ENABLED == 'true'           # kill switch: set the repository variable to anything else to stop all runs
+    runs-on: ubuntu-latest                  # GitHub-hosted standard runner (free for public repositories)
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read                         # only for the run-count guard
+    steps:
+      - name: Run-count guard (program-side budget; fails before anything else happens)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MAX_RUNS: ${{ vars.SB_MAX_RUNS }}
+        run: |
+          set -euo pipefail
+          MAX="${MAX_RUNS:-5}"
+          [[ "$MAX" =~ ^[0-9]{1,3}$ ]] || { echo "::error::bad SB_MAX_RUNS"; exit 1; }
+          TOTAL="$(gh api "repos/$REPO/actions/runs?per_page=1" --jq '.total_count')"
+          [[ "$TOTAL" =~ ^[0-9]+$ ]] || { echo "::error::cannot read the run count"; exit 1; }
+          echo "total_runs=$TOTAL max=$MAX"
+          [ "$TOTAL" -le "$MAX" ] || { echo "::error::run budget exceeded"; exit 1; }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # v4.x, pinned by `sandbox_kit build --pin`
+        with:
+          persist-credentials: false        # the token is not left in .git/config
+      - name: Capture (values reach the script only through environment variables)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_NUMBER: ${{ github.run_number }}
+          WORKFLOW: ${{ github.workflow }}
+          JOB: ${{ github.job }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          OUT: ${{ runner.temp }}/sb-a
+        run: |
+          set -euo pipefail
+          python3 tools/capture.py context --out-dir "$OUT"
+          python3 tools/capture.py event --kind dispatch --event-file "$GITHUB_EVENT_PATH" --out-dir "$OUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.x, pinned by `sandbox_kit build --pin`
+        with:
+          name: sb-a-context
+          path: ${{ runner.temp }}/sb-a/
+          if-no-files-found: error
+          retention-days: 1                 # public repository: artifacts are readable by anyone; keep them short-lived
