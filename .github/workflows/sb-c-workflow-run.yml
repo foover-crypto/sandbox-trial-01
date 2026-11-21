@@ -1,0 +1,245 @@
+# Disposable sandbox workflow (synthetic data only).
+#
+# Workflow C (workflow_run): started by the completion of sb-b-pr-event. It runs from the DEFAULT BRANCH definition
+# (GITHUB_SHA = last commit on the default branch, GitHub docs), so its code is the trusted sandbox code, never the PR's.
+# It records the real workflow_run payload (reduced + shape), the REST pull-request object (reduced + shape), the
+# changed-file list, and a verified inventory of B's artifact. B's artifact is checked against the trusted event and the
+# REST metadata first, then unpacked by an allow-list OUTSIDE the workspace and only listed (name / size / sha256): it is
+# never imported or executed here (meta.json is read as an untrusted claim; XML is never parsed).
+# Stage 1: NO secrets, NO environment, NO OpenAI / Anthropic. GitHub notes that workflow_run workflows can reach secrets
+# and write tokens even when the triggering run could not, so the permission block below is deliberately minimal.
+# Chain depth: B -> C is level 2 of at most 3 (GitHub: "can't use workflow_run to chain together more than three levels").
+name: sb-c-workflow-run
+on:
+  workflow_run:
+    workflows: [sb-b-pr-event]
+    types: [completed]
+permissions: {}
+
+concurrency:
+  group: sb-c-workflow-run                  # one at a time; the default queue keeps at most one pending run.
+  # `queue: max` is tested separately (optional workflow sb-d-queue-probe) and is never combined with cancel-in-progress: true.
+
+jobs:
+  capture:
+    if: vars.SB_ENABLED == 'true' && github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read                         # run-count guard + downloading B's artifact
+      pull-requests: read                   # REST "Get a pull request" / "List pull request files"
+    steps:
+      - name: Run-count guard (program-side budget)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MAX_RUNS: ${{ vars.SB_MAX_RUNS }}
+        run: |
+          set -euo pipefail
+          MAX="${MAX_RUNS:-5}"
+          [[ "$MAX" =~ ^[0-9]{1,3}$ ]] || { echo "::error::bad SB_MAX_RUNS"; exit 1; }
+          TOTAL="$(gh api "repos/$REPO/actions/runs?per_page=1" --jq '.total_count')"
+          [[ "$TOTAL" =~ ^[0-9]+$ ]] || { echo "::error::cannot read the run count"; exit 1; }
+          echo "total_runs=$TOTAL max=$MAX"
+          [ "$TOTAL" -le "$MAX" ] || { echo "::error::run budget exceeded"; exit 1; }
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683   # no `ref:` -> the default branch (trusted code only)
+        with:
+          persist-credentials: false
+      - name: Capture the workflow_run payload, the REST pull request and the changed files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_NUMBER: ${{ github.run_number }}
+          WORKFLOW: ${{ github.workflow }}
+          JOB: ${{ github.job }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+          EVENT_ACTION: ${{ github.event.action }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          OUT: ${{ runner.temp }}/sb-c
+          RAW: ${{ runner.temp }}/sb-c-raw
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$OUT" "$RAW"
+          python3 tools/capture.py context --out-dir "$OUT"
+          python3 tools/capture.py event --kind workflow_run --event-file "$GITHUB_EVENT_PATH" --out-dir "$OUT"
+          PR_NUMBER="$(python3 tools/capture.py pr-number --event-file "$GITHUB_EVENT_PATH")"
+          if [[ "$PR_NUMBER" =~ ^[0-9]{1,9}$ ]]; then
+            gh api "repos/$REPO/pulls/$PR_NUMBER" > "$RAW/pr.json"
+            gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[]' > "$RAW/files.jsonl"
+            python3 tools/capture.py rest-pr --in "$RAW/pr.json" --out-dir "$OUT"
+            python3 tools/capture.py changed --in "$RAW/files.jsonl" --out-dir "$OUT"
+          else
+            echo "::notice::workflow_run.pull_requests is empty or ambiguous; nothing else is fetched (recorded in the shape)"
+          fi
+      # B's artifact is UNTRUSTED DATA. Everything below runs from the default branch (trusted code); the artifact is only
+      # verified, size-limited, unpacked by an allow-list into a private directory, hashed and listed. Never executed,
+      # never imported; XML is not parsed; meta.json is read only as a CLAIM that is compared with the trusted event.
+      # The artifacts API does not say which run attempt produced an artifact: that binding is recorded as UNKNOWN.
+      - name: Verify B's run and artifact metadata, then unpack the artifact as inert data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TEST_RUN_ID: ${{ github.event.workflow_run.id }}
+          TEST_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          TEST_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          TEST_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          OUT: ${{ runner.temp }}/sb-c
+          RAW: ${{ runner.temp }}/sb-c-raw
+          DEST: ${{ runner.temp }}/b-artifact
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$TEST_RUN_ID" =~ ^[0-9]{1,20}$ && "$TEST_RUN_ATTEMPT" =~ ^[0-9]{1,3}$ && "$TEST_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad run identity"; exit 1; }
+          gh api "repos/$REPO/actions/runs/$TEST_RUN_ID" > "$RAW/run.json"
+          gh api "repos/$REPO/actions/runs/$TEST_RUN_ID/artifacts" > "$RAW/artifacts.json"
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, zipfile
+          from pathlib import Path
+
+          NAME = "sb-b-pr-event"
+          WF_PATH = ".github/workflows/sb-b-pr-event.yml"
+          ALLOWED = {"junit.xml", "meta.json", "context.json", "pull_request.reduced.json", "pull_request.shape.json"}
+          MAX_ZIP, MAX_FILE, MAX_TOTAL, MAX_ENTRIES, MAX_JSON = 1 << 20, 2 << 20, 4 << 20, 20, 8 << 20
+          env = os.environ
+          out, raw, dest = Path(env["OUT"]), Path(env["RAW"]), Path(env["DEST"])
+          v = {"verdict": "REJECTED", "checks": {}, "reasons": [], "artifact": None, "downloaded": False,
+               "extracted": False, "xml_parsed": False, "executed": False, "meta_claim": None,
+               "attempt_binding": "UNKNOWN: the artifacts API does not state which run attempt produced an artifact"}
+
+
+          def ok(name, cond, why):
+              v["checks"][name] = bool(cond)
+              if not cond:
+                  v["reasons"].append(why)
+              return bool(cond)
+
+
+          def load_json(path):
+              p = Path(path)
+              if not p.is_file() or p.stat().st_size > MAX_JSON:
+                  raise ValueError("unreadable or oversized json")
+              return json.loads(p.read_text(encoding="utf-8"))
+
+
+          def get(o, *path):
+              for k in path:
+                  o = o.get(k) if isinstance(o, dict) else None
+              return o
+
+
+          def verify():
+              run_id, attempt, sha = int(env["TEST_RUN_ID"]), int(env["TEST_RUN_ATTEMPT"]), env["TEST_HEAD_SHA"]
+              run, arts = load_json(raw / "run.json"), load_json(raw / "artifacts.json")
+              ok("run.id", get(run, "id") == run_id, "REST run id differs from the event")
+              ok("run.attempt", get(run, "run_attempt") == attempt, "REST run_attempt differs from the event")
+              ok("run.head_sha", get(run, "head_sha") == sha, "REST head_sha differs from the event")
+              ok("run.event", get(run, "event") == "pull_request", "the run is not a pull_request run")
+              ok("run.completed", get(run, "status") == "completed", "the run is not completed")
+              ok("run.conclusion", get(run, "conclusion") == env["TEST_CONCLUSION"], "REST conclusion differs from the event")
+              ok("run.workflow_path", str(get(run, "path")).startswith(WF_PATH), "the run is not workflow B")
+              ok("run.repository", str(get(run, "repository", "full_name")).lower() == env["REPO"].lower(), "other repository")
+              lst = get(arts, "artifacts")
+              found = [a for a in lst if isinstance(a, dict) and a.get("name") == NAME] if isinstance(lst, list) else []
+              if not ok("artifact.exactly_one", len(found) == 1, "not exactly one artifact named " + NAME):
+                  return None
+              a = found[0]
+              size, aid = a.get("size_in_bytes"), a.get("id")
+              v["artifact"] = {"id": aid, "size_in_bytes": size, "expired": a.get("expired")}
+              ok("artifact.not_expired", a.get("expired") is False, "artifact expired")
+              ok("artifact.size", isinstance(size, int) and 0 < size <= MAX_ZIP, "artifact size out of range")
+              ok("artifact.run_id", get(a, "workflow_run", "id") == run_id, "artifact belongs to another run")
+              ok("artifact.head_sha", get(a, "workflow_run", "head_sha") == sha, "artifact head_sha differs from the event")
+              ok("artifact.id", isinstance(aid, int) and not isinstance(aid, bool) and aid > 0, "bad artifact id")
+              return aid if all(v["checks"].values()) else None
+
+
+          def fetch(aid):
+              zpath = raw / "b-artifact.zip"
+              with open(zpath, "wb") as f:
+                  subprocess.run(["gh", "api", "repos/" + env["REPO"] + "/actions/artifacts/" + str(aid) + "/zip"],
+                                 stdout=f, check=True, timeout=120)
+              v["downloaded"] = True
+              n = zpath.stat().st_size
+              ok("zip.size_matches", n == v["artifact"]["size_in_bytes"] and n <= MAX_ZIP, "downloaded size differs from the metadata")
+              return zpath if all(v["checks"].values()) else None
+
+
+          def extract(zpath):
+              with zipfile.ZipFile(zpath) as zf:
+                  infos = zf.infolist()
+                  names = [i.filename for i in infos]
+                  ok("zip.entries", 0 < len(infos) <= MAX_ENTRIES, "too many or no entries")
+                  ok("zip.names_allowed", all(n in ALLOWED for n in names), "an entry name is not on the allow-list (path / traversal / unknown)")
+                  ok("zip.names_unique", len(set(names)) == len(names), "duplicate entry names")
+                  ok("zip.plain_files", all(((i.external_attr >> 16) & 0o170000) != 0o120000 and not (i.flag_bits & 1) and not i.is_dir() for i in infos), "symlink, directory or encrypted entry")
+                  ok("zip.declared_sizes", all(i.file_size <= MAX_FILE for i in infos) and sum(i.file_size for i in infos) <= MAX_TOTAL, "declared size over the limit")
+                  if not all(v["checks"].values()):
+                      return None
+                  dest.mkdir(parents=True, exist_ok=False)
+                  files, total, meta = [], 0, None
+                  for i in infos:
+                      data = zf.open(i).read(MAX_FILE + 1)
+                      total += len(data)
+                      if len(data) > MAX_FILE or total > MAX_TOTAL:
+                          ok("zip.actual_sizes", False, "actual size over the limit")
+                          return None
+                      (dest / i.filename).write_bytes(data)
+                      files.append({"name": i.filename, "kind": "file", "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+                      if i.filename == "meta.json":
+                          meta = data
+                  v["extracted"] = True
+                  if meta is not None:
+                      try:
+                          m = json.loads(meta.decode("utf-8"))
+                      except ValueError:
+                          m = None
+                      if isinstance(m, dict):
+                          ec = m.get("exit_code")
+                          good = isinstance(ec, int) and not isinstance(ec, bool)
+                          v["meta_claim"] = {"untrusted": True, "pr": m.get("pr"), "exit_code": ec,
+                                             "head_sha_matches_event": m.get("head_sha") == env["TEST_HEAD_SHA"],
+                                             "exit_code_consistent_with_conclusion": good and ((ec == 0) == (env["TEST_CONCLUSION"] == "success"))}
+                  return files
+
+
+          def main():
+              files = None
+              try:
+                  aid = verify()
+                  zpath = fetch(aid) if aid is not None else None
+                  files = extract(zpath) if zpath is not None else None
+              except Exception as e:
+                  v["reasons"].append("exception: " + type(e).__name__)
+              v["verdict"] = "VERIFIED" if v["extracted"] and not v["reasons"] else "REJECTED"
+              out.mkdir(parents=True, exist_ok=True)
+              (out / "artifact-verification.json").write_text(json.dumps(v, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+              if files is not None:
+                  doc = {"files": files, "parsed": False, "executed": False}
+                  (out / "artifact-inventory.json").write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+              print("artifact verdict: " + v["verdict"])
+              if v["verdict"] != "VERIFIED":
+                  print("::warning::the artifact was not accepted; see artifact-verification.json")
+
+
+          main()
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02   # v4.x, pinned by `sandbox_kit build --pin`
+        with:
+          name: sb-c-workflow-run
+          path: ${{ runner.temp }}/sb-c/
+          if-no-files-found: error
+          retention-days: 1
+# Nothing here pushes, merges, labels, comments or starts another workflow: the chain stops at this job.
